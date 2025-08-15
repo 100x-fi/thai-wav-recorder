@@ -47,15 +47,43 @@ def _next_id():
     return i
 
 
+def get_last_status():
+    """Return markdown showing last row and total count."""
+    if not os.path.exists(META_PATH):
+        return "ยังไม่มี metadata.csv"
+    with open(META_PATH, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    if not lines:
+        return "ยังไม่มีรายการใน metadata.csv"
+    last = lines[-1]
+    total = len(lines)
+    if "|" in last:
+        utt, text = last.split("|", 1)
+        return f"**ไฟล์ล่าสุด:** `{utt}`   \n**ข้อความล่าสุด:** {text}    \n**ทั้งหมด:** {total} แถว"
+    return f"**ไฟล์ล่าสุด (raw):** `{last}`  \n**ทั้งหมด:** {total} แถว"
+
+
 def save_sample(audio, text, manual_id, normalize=True, trim=True):
     # ถ้ายังไม่ใส่ข้อความ
     if not text or not text.strip():
-        # ไม่เปลี่ยนค่า next_id_out / manual_id
-        return gr.update(value=""), "⚠️ ใส่ข้อความก่อน", gr.update(), gr.update()
+        # ไม่เปลี่ยนค่า next_id_out / manual_id / last_row
+        return (
+            gr.update(value=""),
+            "⚠️ ใส่ข้อความก่อน",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
 
     # audio is (sr, data) when "microphone=True" in Gradio
     if audio is None or audio[1] is None:
-        return text, "⚠️ ยังไม่มีเสียง (กดอัด/Allow mic)", gr.update(), gr.update()
+        return (
+            text,
+            "⚠️ ยังไม่มีเสียง (กดอัด/Allow mic)",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
 
     sr, data = audio
     y = np.array(data, dtype=np.float32)
@@ -85,24 +113,25 @@ def save_sample(audio, text, manual_id, normalize=True, trim=True):
         f.write(f"{utt_id}|{text.strip()}\n")
 
     next_hint = idx + 1
-    # อัปเดต: ล้างช่องข้อความ, แสดงสถานะ, ตั้งค่า Id ถัดไป (ทั้งช่องแนะนำและช่องกรอก)
+    # ล้างช่องข้อความ, แสดงสถานะ, ตั้งค่า Id ถัดไป (ทั้งช่องแนะนำและช่องกรอก), และอัปเดตบรรทัดล่าสุด
     return (
         "",
         f"✅ Saved {utt_id}.wav and appended to metadata.csv",
         str(next_hint),
         str(next_hint),
+        get_last_status(),
     )
 
 
 def undo_last():
     # remove last row and file
     if not os.path.exists(META_PATH):
-        return "ไม่มี metadata.csv"
+        return "ไม่มี metadata.csv", get_last_status()
     lines = []
     with open(META_PATH, "r", encoding="utf-8") as f:
         lines = f.readlines()
     if not lines:
-        return "ไม่มีรายการให้ลบ"
+        return "ไม่มีรายการให้ลบ", get_last_status()
     last = lines[-1].strip()
     if "|" in last:
         utt_id = last.split("|", 1)[0]
@@ -111,10 +140,10 @@ def undo_last():
             os.remove(wav_path)
     with open(META_PATH, "w", encoding="utf-8") as f:
         f.writelines(lines[:-1])
-    return f"↩️ ลบ {last} แล้ว"
+    return f"↩️ ลบ {last} แล้ว", get_last_status()
 
 
-# ---------- New: prompt loader + navigator (next/prev) ----------
+# ---------- prompt loader + navigator (next/prev) ----------
 def load_prompts(file_input):
     """Read prompts.txt -> return list, reset idx=0, set textbox to first."""
     if not file_input:
@@ -159,14 +188,14 @@ with gr.Blocks() as demo:
     with gr.Row():
         mic = gr.Audio(sources=["microphone"], type="numpy")
         with gr.Column():
-            # ---- replaced Dropdown with Prev/Next + progress ----
+            # ---- Prev/Next + progress ----
             prompts_state = gr.State([])  # list[str]
             idx_state = gr.State(0)  # current index
             with gr.Row():
                 prev_btn = gr.Button("ก่อนหน้า")
                 next_btn = gr.Button("ถัดไป")
                 progress = gr.Markdown("0/0")  # shows "i/N"
-            # ------------------------------------------------------
+            # ------------------------------
             txt = gr.Textbox(label="ข้อความ (ไทย)")
             with gr.Row():
                 manual_id = gr.Textbox(
@@ -180,6 +209,9 @@ with gr.Blocks() as demo:
             status = gr.Markdown()
             undo = gr.Button("↩️ Undo รายการล่าสุด")
             status2 = gr.Markdown()
+            # ---- Last row display + refresh ----
+            last_row_md = gr.Markdown("ล่าสุด: -")
+            refresh_last = gr.Button("รีเฟรชรายการล่าสุด")
     with gr.Row():
         prompts_txt = gr.File(
             label="อัปโหลด prompts.txt (1 บรรทัด/ประโยค)",
@@ -187,6 +219,12 @@ with gr.Blocks() as demo:
             type="filepath",
         )
         load_status = gr.Markdown()
+
+    # init last-row on load
+    demo.load(lambda: get_last_status(), inputs=None, outputs=[last_row_md])
+
+    # refresh button
+    refresh_last.click(lambda: get_last_status(), inputs=None, outputs=[last_row_md])
 
     # When upload: store list in state, reset idx=0, put first into textbox, update status+progress
     prompts_txt.upload(
@@ -207,17 +245,15 @@ with gr.Blocks() as demo:
         outputs=[idx_state, txt, progress],
     )
 
+    # Save: update txt (clear), status, next_id_out, manual_id, and last-row display
     btn.click(
         save_sample,
         inputs=[mic, txt, manual_id, normalize, trim],
-        outputs=[
-            txt,
-            status,
-            next_id_out,
-            manual_id,
-        ],  # <- เพิ่ม manual_id เป็น output ที่ 4
+        outputs=[txt, status, next_id_out, manual_id, last_row_md],
     )
-    undo.click(lambda: undo_last(), inputs=None, outputs=[status2])
+
+    # Undo: also update last-row display
+    undo.click(lambda: undo_last(), inputs=None, outputs=[status2, last_row_md])
 
 if __name__ == "__main__":
     demo.launch()
