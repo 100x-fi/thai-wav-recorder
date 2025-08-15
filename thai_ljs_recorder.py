@@ -106,25 +106,43 @@ def undo_last():
     return f"↩️ ลบ {last} แล้ว"
 
 
+# ---------- New: prompt loader + navigator (next/prev) ----------
 def load_prompts(file_input):
-    # ไม่มีไฟล์
+    """Read prompts.txt -> return list, reset idx=0, set textbox to first."""
     if not file_input:
-        return gr.update(choices=[], value=None), "อัปโหลดไฟล์ .txt ที่มี 1 บรรทัด/บรรทัด"
+        return [], 0, "", "อัปโหลดไฟล์ .txt ที่มี 1 บรรทัด/ประโยค", "0/0"
 
-    # file_input อาจเป็น str หรือ NamedString ที่มี .name
     path = getattr(file_input, "name", None) or str(file_input)
-
     try:
-        # utf-8-sig รองรับไฟล์ที่มี BOM
         with open(path, "r", encoding="utf-8-sig") as f:
             content = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
     except Exception as e:
-        return gr.update(choices=[], value=None), f"อ่านไฟล์ไม่ได้: {e}"
+        return [], 0, "", f"อ่านไฟล์ไม่ได้: {e}", "0/0"
 
-    return (
-        gr.update(choices=content, value=(content[0] if content else None)),
-        f"โหลด {len(content)} บรรทัด",
-    )
+    first = content[0] if content else ""
+    prog = f"1/{len(content)}" if content else "0/0"
+    return content, 0, first, f"โหลด {len(content)} บรรทัด", prog
+
+
+def _nav(prompts, idx, step):
+    """Move index by step (+1 next, -1 prev)."""
+    n = len(prompts)
+    if n == 0:
+        return 0, "", "0/0"
+    new_idx = int(idx) + int(step)
+    new_idx = max(0, min(n - 1, new_idx))
+    return new_idx, prompts[new_idx], f"{new_idx + 1}/{n}"
+
+
+def go_next(prompts, idx):
+    return _nav(prompts, idx, +1)
+
+
+def go_prev(prompts, idx):
+    return _nav(prompts, idx, -1)
+
+
+# ----------------------------------------------------------------
 
 
 with gr.Blocks() as demo:
@@ -133,7 +151,14 @@ with gr.Blocks() as demo:
     with gr.Row():
         mic = gr.Audio(sources=["microphone"], type="numpy")
         with gr.Column():
-            prompt_dd = gr.Dropdown(label="เลือกข้อความจากรายการ (ไม่บังคับ)", choices=[])
+            # ---- replaced Dropdown with Prev/Next + progress ----
+            prompts_state = gr.State([])  # list[str]
+            idx_state = gr.State(0)  # current index
+            with gr.Row():
+                prev_btn = gr.Button("ก่อนหน้า")
+                next_btn = gr.Button("ถัดไป")
+                progress = gr.Markdown("0/0")  # shows "i/N"
+            # ------------------------------------------------------
             txt = gr.Textbox(label="ข้อความ (ไทย)")
             with gr.Row():
                 manual_id = gr.Textbox(
@@ -151,15 +176,29 @@ with gr.Blocks() as demo:
         prompts_txt = gr.File(
             label="อัปโหลด prompts.txt (1 บรรทัด/ประโยค)",
             file_types=[".txt"],
-            type="filepath",  # <<< สำคัญ
+            type="filepath",
         )
-
         load_status = gr.Markdown()
 
+    # When upload: store list in state, reset idx=0, put first into textbox, update status+progress
     prompts_txt.upload(
-        load_prompts, inputs=[prompts_txt], outputs=[prompt_dd, load_status]
+        load_prompts,
+        inputs=[prompts_txt],
+        outputs=[prompts_state, idx_state, txt, load_status, progress],
     )
-    prompt_dd.change(lambda s: gr.update(value=s), inputs=prompt_dd, outputs=txt)
+
+    # Navigate with buttons
+    next_btn.click(
+        go_next,
+        inputs=[prompts_state, idx_state],
+        outputs=[idx_state, txt, progress],
+    )
+    prev_btn.click(
+        go_prev,
+        inputs=[prompts_state, idx_state],
+        outputs=[idx_state, txt, progress],
+    )
+
     btn.click(
         save_sample,
         inputs=[mic, txt, manual_id, normalize, trim],
