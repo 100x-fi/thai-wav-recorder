@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""
+Thai LJS Recorder (Gradio)
+- Records one utterance at a time from your mic
+- Saves WAV into ./wavs/uttXXXX.wav (mono, 22050 Hz)
+- Appends a row to ./metadata.csv as: uttXXXX|<thai text>
+Usage:
+  pip install gradio soundfile numpy scipy librosa
+  python thai_ljs_recorder.py
+Then open the local URL in your browser.
+"""
+import os, csv, time, io
+import numpy as np
+import gradio as gr
+import soundfile as sf
+import librosa
+
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+WAV_DIR = os.path.join(DATA_DIR, "wavs")
+META_PATH = os.path.join(DATA_DIR, "metadata.csv")
+os.makedirs(WAV_DIR, exist_ok=True)
+
+SR = 22050
+
+
+def _next_id():
+    # find next integer index based on existing files or metadata rows
+    i = 1
+    if os.path.exists(META_PATH):
+        with open(META_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if "|" in line:
+                    utt = line.split("|", 1)[0].strip()
+                    if utt.startswith("utt"):
+                        try:
+                            i = max(i, int(utt[3:]) + 1)
+                        except:
+                            pass
+    else:
+        # also scan files
+        for fn in os.listdir(WAV_DIR):
+            if fn.startswith("utt") and fn.endswith(".wav"):
+                try:
+                    i = max(i, int(fn[3:-4]) + 1)
+                except:
+                    pass
+    return i
+
+
+def save_sample(audio, text, manual_id, normalize=True, trim=True):
+    if not text or not text.strip():
+        return gr.update(value=""), "⚠️ ใส่ข้อความก่อน", None
+
+    # audio is (sr, data) when "microphone=True" in Gradio
+    if audio is None or audio[1] is None:
+        return text, "⚠️ ยังไม่มีเสียง (กดอัด/Allow mic)", None
+
+    sr, data = audio
+    y = np.array(data, dtype=np.float32)
+    if y.ndim == 2:
+        y = np.mean(y, axis=1)  # mono
+    # resample
+    if sr != SR:
+        y = librosa.resample(y, orig_sr=sr, target_sr=SR)
+    # optional trim
+    if trim:
+        yt, _ = librosa.effects.trim(y, top_db=30)
+        if len(yt) > int(0.3 * SR):  # keep >300ms
+            y = yt
+    # optional normalize
+    if normalize:
+        peak = np.max(np.abs(y)) + 1e-9
+        y = y / peak * 0.98
+
+    # pick id
+    idx = int(manual_id) if manual_id else _next_id()
+    utt_id = f"utt{idx:04d}"
+    wav_path = os.path.join(WAV_DIR, f"{utt_id}.wav")
+    sf.write(wav_path, y, SR, subtype="PCM_16")
+
+    # append metadata
+    with open(META_PATH, "a", encoding="utf-8") as f:
+        f.write(f"{utt_id}|{text.strip()}\n")
+
+    next_hint = idx + 1
+    return "", f"✅ Saved {utt_id}.wav and appended to metadata.csv", str(next_hint)
+
+
+def undo_last():
+    # remove last row and file
+    if not os.path.exists(META_PATH):
+        return "ไม่มี metadata.csv"
+    lines = []
+    with open(META_PATH, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if not lines:
+        return "ไม่มีรายการให้ลบ"
+    last = lines[-1].strip()
+    if "|" in last:
+        utt_id = last.split("|", 1)[0]
+        wav_path = os.path.join(WAV_DIR, f"{utt_id}.wav")
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines[:-1])
+    return f"↩️ ลบ {last} แล้ว"
+
+
+def load_prompts(file_input):
+    # ไม่มีไฟล์
+    if not file_input:
+        return gr.update(choices=[], value=None), "อัปโหลดไฟล์ .txt ที่มี 1 บรรทัด/บรรทัด"
+
+    # file_input อาจเป็น str หรือ NamedString ที่มี .name
+    path = getattr(file_input, "name", None) or str(file_input)
+
+    try:
+        # utf-8-sig รองรับไฟล์ที่มี BOM
+        with open(path, "r", encoding="utf-8-sig") as f:
+            content = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+    except Exception as e:
+        return gr.update(choices=[], value=None), f"อ่านไฟล์ไม่ได้: {e}"
+
+    return (
+        gr.update(choices=content, value=(content[0] if content else None)),
+        f"โหลด {len(content)} บรรทัด",
+    )
+
+
+with gr.Blocks() as demo:
+    gr.Markdown("# Thai LJS Recorder")
+    gr.Markdown("บันทึกทีละประโยค → ได้ไฟล์ WAV และเพิ่มแถวใน metadata.csv อัตโนมัติ")
+    with gr.Row():
+        mic = gr.Audio(sources=["microphone"], type="numpy")
+        with gr.Column():
+            prompt_dd = gr.Dropdown(label="เลือกข้อความจากรายการ (ไม่บังคับ)", choices=[])
+            txt = gr.Textbox(label="ข้อความ (ไทย)")
+            with gr.Row():
+                manual_id = gr.Textbox(
+                    label="เลขไอดีถัดไป (ว่าง = อัตโนมัติ)", value=str(_next_id())
+                )
+                next_id_out = gr.Textbox(label="Id ถัดไป (แนะนำ)", interactive=False)
+            with gr.Row():
+                normalize = gr.Checkbox(label="Normalize", value=True)
+                trim = gr.Checkbox(label="Auto-trim", value=True)
+            btn = gr.Button("บันทึก")
+            status = gr.Markdown()
+            undo = gr.Button("↩️ Undo รายการล่าสุด")
+            status2 = gr.Markdown()
+    with gr.Row():
+        prompts_txt = gr.File(
+            label="อัปโหลด prompts.txt (1 บรรทัด/ประโยค)",
+            file_types=[".txt"],
+            type="filepath",  # <<< สำคัญ
+        )
+
+        load_status = gr.Markdown()
+
+    prompts_txt.upload(
+        load_prompts, inputs=[prompts_txt], outputs=[prompt_dd, load_status]
+    )
+    prompt_dd.change(lambda s: gr.update(value=s), inputs=prompt_dd, outputs=txt)
+    btn.click(
+        save_sample,
+        inputs=[mic, txt, manual_id, normalize, trim],
+        outputs=[txt, status, next_id_out],
+    )
+    undo.click(lambda: undo_last(), inputs=None, outputs=[status2])
+
+if __name__ == "__main__":
+    demo.launch()
