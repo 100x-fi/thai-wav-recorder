@@ -48,12 +48,14 @@ def _next_id():
 
 
 def save_sample(audio, text, manual_id, normalize=True, trim=True):
+    # ถ้ายังไม่ใส่ข้อความ
     if not text or not text.strip():
-        return gr.update(value=""), "⚠️ ใส่ข้อความก่อน", None
+        # ไม่เปลี่ยนค่า next_id_out / manual_id
+        return gr.update(value=""), "⚠️ ใส่ข้อความก่อน", gr.update(), gr.update()
 
     # audio is (sr, data) when "microphone=True" in Gradio
     if audio is None or audio[1] is None:
-        return text, "⚠️ ยังไม่มีเสียง (กดอัด/Allow mic)", None
+        return text, "⚠️ ยังไม่มีเสียง (กดอัด/Allow mic)", gr.update(), gr.update()
 
     sr, data = audio
     y = np.array(data, dtype=np.float32)
@@ -83,7 +85,13 @@ def save_sample(audio, text, manual_id, normalize=True, trim=True):
         f.write(f"{utt_id}|{text.strip()}\n")
 
     next_hint = idx + 1
-    return "", f"✅ Saved {utt_id}.wav and appended to metadata.csv", str(next_hint)
+    # อัปเดต: ล้างช่องข้อความ, แสดงสถานะ, ตั้งค่า Id ถัดไป (ทั้งช่องแนะนำและช่องกรอก)
+    return (
+        "",
+        f"✅ Saved {utt_id}.wav and appended to metadata.csv",
+        str(next_hint),
+        str(next_hint),
+    )
 
 
 def undo_last():
@@ -202,7 +210,12 @@ with gr.Blocks() as demo:
     btn.click(
         save_sample,
         inputs=[mic, txt, manual_id, normalize, trim],
-        outputs=[txt, status, next_id_out],
+        outputs=[
+            txt,
+            status,
+            next_id_out,
+            manual_id,
+        ],  # <- เพิ่ม manual_id เป็น output ที่ 4
     )
     undo.click(lambda: undo_last(), inputs=None, outputs=[status2])
 
