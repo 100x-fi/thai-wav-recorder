@@ -63,13 +63,75 @@ def get_last_status():
     return f"**ไฟล์ล่าสุด (raw):** `{last}`  \n**ทั้งหมด:** {total} แถว"
 
 
+# ---------- Table helpers ----------
+def _read_table_rows():
+    """Read metadata.csv -> rows [[filename.wav, text, '▶︎ เล่น'], ...]"""
+    rows = []
+    if not os.path.exists(META_PATH):
+        return rows
+    with open(META_PATH, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or "|" not in ln:
+                continue
+            utt, text = ln.split("|", 1)
+            filename = f"{utt}.wav"
+            rows.append([filename, text, "▶︎ เล่น"])
+    return rows
+
+
+def load_table():
+    """Return DataFrame value for table tab."""
+    return gr.update(value=_read_table_rows())
+
+
+def _rows_from_table(table):
+    """Convert gr.Dataframe value to list-of-lists, robust to pandas.DataFrame."""
+    if table is None:
+        return []
+    # pandas.DataFrame -> list
+    try:
+        import pandas as pd
+
+        if isinstance(table, pd.DataFrame):
+            return table.values.tolist()
+    except Exception:
+        pass
+    # dict format (rare)
+    if isinstance(table, dict) and "data" in table:
+        return table["data"]
+    # already list-of-lists
+    return table
+
+
+def play_from_table(evt: gr.SelectData, table):
+    """Play audio for the selected row."""
+    # evt.index is (row, col)
+    idx = None
+    if evt is not None and getattr(evt, "index", None) is not None:
+        if isinstance(evt.index, (list, tuple)):
+            idx = evt.index[0]
+        else:
+            idx = int(evt.index)
+    rows = _rows_from_table(table)
+    if idx is None or idx < 0 or idx >= len(rows):
+        return gr.update()  # no change
+    filename = rows[idx][0]  # first column is filename 'uttXXXX.wav'
+    path = os.path.join(WAV_DIR, filename)
+    return path if os.path.exists(path) else gr.update()
+
+
+# -----------------------------------
+
+
 def save_sample(audio, text, manual_id, normalize=True, trim=True):
     # ถ้ายังไม่ใส่ข้อความ
     if not text or not text.strip():
-        # ไม่เปลี่ยนค่า next_id_out / manual_id / last_row
+        # ไม่เปลี่ยนค่า next_id_out / manual_id / last_row / table
         return (
             gr.update(value=""),
             "⚠️ ใส่ข้อความก่อน",
+            gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
@@ -80,6 +142,7 @@ def save_sample(audio, text, manual_id, normalize=True, trim=True):
         return (
             text,
             "⚠️ ยังไม่มีเสียง (กดอัด/Allow mic)",
+            gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
@@ -113,25 +176,27 @@ def save_sample(audio, text, manual_id, normalize=True, trim=True):
         f.write(f"{utt_id}|{text.strip()}\n")
 
     next_hint = idx + 1
-    # ล้างช่องข้อความ, แสดงสถานะ, ตั้งค่า Id ถัดไป (ทั้งช่องแนะนำและช่องกรอก), และอัปเดตบรรทัดล่าสุด
+    # ล้างช่องข้อความ, แสดงสถานะ, ตั้งค่า Id ถัดไป (ทั้งช่องแนะนำและช่องกรอก),
+    # อัปเดตบรรทัดล่าสุด, และอัปเดตตารางในแท็บ CSV
     return (
         "",
         f"✅ Saved {utt_id}.wav and appended to metadata.csv",
         str(next_hint),
         str(next_hint),
         get_last_status(),
+        load_table(),
     )
 
 
 def undo_last():
     # remove last row and file
     if not os.path.exists(META_PATH):
-        return "ไม่มี metadata.csv", get_last_status()
+        return "ไม่มี metadata.csv", get_last_status(), load_table()
     lines = []
     with open(META_PATH, "r", encoding="utf-8") as f:
         lines = f.readlines()
     if not lines:
-        return "ไม่มีรายการให้ลบ", get_last_status()
+        return "ไม่มีรายการให้ลบ", get_last_status(), load_table()
     last = lines[-1].strip()
     if "|" in last:
         utt_id = last.split("|", 1)[0]
@@ -140,7 +205,7 @@ def undo_last():
             os.remove(wav_path)
     with open(META_PATH, "w", encoding="utf-8") as f:
         f.writelines(lines[:-1])
-    return f"↩️ ลบ {last} แล้ว", get_last_status()
+    return f"↩️ ลบ {last} แล้ว", get_last_status(), load_table()
 
 
 # ---------- prompt loader + navigator (next/prev) ----------
@@ -184,76 +249,104 @@ def go_prev(prompts, idx):
 
 with gr.Blocks() as demo:
     gr.Markdown("# Thai LJS Recorder")
-    gr.Markdown("บันทึกทีละประโยค → ได้ไฟล์ WAV และเพิ่มแถวใน metadata.csv อัตโนมัติ")
-    with gr.Row():
-        mic = gr.Audio(sources=["microphone"], type="numpy")
-        with gr.Column():
-            # ---- Prev/Next + progress ----
-            prompts_state = gr.State([])  # list[str]
-            idx_state = gr.State(0)  # current index
+
+    with gr.Tabs():
+        # ---------------- Tab 1: Recorder ----------------
+        with gr.Tab("บันทึก"):
+            gr.Markdown("บันทึกทีละประโยค → ได้ไฟล์ WAV และเพิ่มแถวใน metadata.csv อัตโนมัติ")
             with gr.Row():
-                prev_btn = gr.Button("ก่อนหน้า")
-                next_btn = gr.Button("ถัดไป")
-                progress = gr.Markdown("0/0")  # shows "i/N"
-            # ------------------------------
-            txt = gr.Textbox(label="ข้อความ (ไทย)")
+                mic = gr.Audio(sources=["microphone"], type="numpy")
+                with gr.Column():
+                    # Prev/Next + progress
+                    prompts_state = gr.State([])  # list[str]
+                    idx_state = gr.State(0)  # current index
+                    with gr.Row():
+                        prev_btn = gr.Button("ก่อนหน้า")
+                        next_btn = gr.Button("ถัดไป")
+                        progress = gr.Markdown("0/0")  # shows "i/N"
+                    # Text + controls
+                    txt = gr.Textbox(label="ข้อความ (ไทย)")
+                    with gr.Row():
+                        manual_id = gr.Textbox(
+                            label="เลขไอดีถัดไป (ว่าง = อัตโนมัติ)", value=str(_next_id())
+                        )
+                        next_id_out = gr.Textbox(
+                            label="Id ถัดไป (แนะนำ)", interactive=False
+                        )
+                    with gr.Row():
+                        normalize = gr.Checkbox(label="Normalize", value=True)
+                        trim = gr.Checkbox(label="Auto-trim", value=True)
+                    btn = gr.Button("บันทึก")
+                    status = gr.Markdown()
+                    undo = gr.Button("↩️ Undo รายการล่าสุด")
+                    status2 = gr.Markdown()
+                    # Last row display + refresh
+                    last_row_md = gr.Markdown("ล่าสุด: -")
+                    refresh_last = gr.Button("รีเฟรชรายการล่าสุด")
+
             with gr.Row():
-                manual_id = gr.Textbox(
-                    label="เลขไอดีถัดไป (ว่าง = อัตโนมัติ)", value=str(_next_id())
+                prompts_txt = gr.File(
+                    label="อัปโหลด prompts.txt (1 บรรทัด/ประโยค)",
+                    file_types=[".txt"],
+                    type="filepath",
                 )
-                next_id_out = gr.Textbox(label="Id ถัดไป (แนะนำ)", interactive=False)
+                load_status = gr.Markdown()
+
+        # ---------------- Tab 2: CSV Table ----------------
+        with gr.Tab("ตาราง CSV"):
+            gr.Markdown("ตารางจาก `metadata.csv`")
+            table = gr.Dataframe(
+                headers=["ชื่อไฟล์", "ข้อความ", "เล่นไฟล์เสียงนี้"],
+                value=[],
+                interactive=False,
+                row_count=(0, "dynamic"),
+                col_count=(3, "fixed"),
+                wrap=True,
+            )
             with gr.Row():
-                normalize = gr.Checkbox(label="Normalize", value=True)
-                trim = gr.Checkbox(label="Auto-trim", value=True)
-            btn = gr.Button("บันทึก")
-            status = gr.Markdown()
-            undo = gr.Button("↩️ Undo รายการล่าสุด")
-            status2 = gr.Markdown()
-            # ---- Last row display + refresh ----
-            last_row_md = gr.Markdown("ล่าสุด: -")
-            refresh_last = gr.Button("รีเฟรชรายการล่าสุด")
-    with gr.Row():
-        prompts_txt = gr.File(
-            label="อัปโหลด prompts.txt (1 บรรทัด/ประโยค)",
-            file_types=[".txt"],
-            type="filepath",
-        )
-        load_status = gr.Markdown()
+                table_refresh = gr.Button("รีเฟรชตาราง")
+                audio_player = gr.Audio(label="ตัวอย่างเสียง", autoplay=False)
 
-    # init last-row on load
-    demo.load(lambda: get_last_status(), inputs=None, outputs=[last_row_md])
+    # ----- wiring -----
 
-    # refresh button
+    # init last-row & table on load
+    demo.load(
+        lambda: (get_last_status(), _read_table_rows()),
+        inputs=None,
+        outputs=[last_row_md, table],
+    )
+
+    # refresh buttons
     refresh_last.click(lambda: get_last_status(), inputs=None, outputs=[last_row_md])
+    table_refresh.click(load_table, inputs=None, outputs=[table])
 
-    # When upload: store list in state, reset idx=0, put first into textbox, update status+progress
+    # upload prompts -> store list, reset idx=0, put first into textbox, update status+progress
     prompts_txt.upload(
         load_prompts,
         inputs=[prompts_txt],
         outputs=[prompts_state, idx_state, txt, load_status, progress],
     )
 
-    # Navigate with buttons
+    # navigate
     next_btn.click(
-        go_next,
-        inputs=[prompts_state, idx_state],
-        outputs=[idx_state, txt, progress],
+        go_next, inputs=[prompts_state, idx_state], outputs=[idx_state, txt, progress]
     )
     prev_btn.click(
-        go_prev,
-        inputs=[prompts_state, idx_state],
-        outputs=[idx_state, txt, progress],
+        go_prev, inputs=[prompts_state, idx_state], outputs=[idx_state, txt, progress]
     )
 
-    # Save: update txt (clear), status, next_id_out, manual_id, and last-row display
+    # save -> also update table
     btn.click(
         save_sample,
         inputs=[mic, txt, manual_id, normalize, trim],
-        outputs=[txt, status, next_id_out, manual_id, last_row_md],
+        outputs=[txt, status, next_id_out, manual_id, last_row_md, table],
     )
 
-    # Undo: also update last-row display
-    undo.click(lambda: undo_last(), inputs=None, outputs=[status2, last_row_md])
+    # undo -> also update table
+    undo.click(lambda: undo_last(), inputs=None, outputs=[status2, last_row_md, table])
+
+    # click any cell -> play that row's audio
+    table.select(play_from_table, inputs=[table], outputs=[audio_player])
 
 if __name__ == "__main__":
     demo.launch()
